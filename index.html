@@ -315,19 +315,75 @@ function undo(){
   s.shown=false;s.done=Math.max(0,s.done-1);
   persist(s.deckId);render();
 }
+var SEPS={tab:'\t',semicolon:';',comma:',',pipe:'|',colon:':',space:' '};
+function decodeHtml(s){var t=document.createElement('textarea');t.innerHTML=s;return t.value}
+function cleanField(s,html){
+  s=String(s).replace(/\[sound:[^\]]*\]/g,'');
+  if(html||/<\/?[a-z][^>]*>/i.test(s)){
+    s=s.replace(/<br\s*\/?>/gi,'\n').replace(/<\/(div|p|li|tr|h[1-6])>/gi,'\n').replace(/<li[^>]*>/gi,'- ').replace(/<[^>]*>/g,'');
+    s=decodeHtml(s);
+  }
+  return s.replace(/ /g,' ').replace(/\\n/g,'\n').replace(/\n{3,}/g,'\n\n').trim();
+}
+function splitRows(txt,sep){
+  var rows=[],row=[],f='',q=false,i=0,n=txt.length,ch;
+  while(i<n){
+    ch=txt[i];
+    if(q){
+      if(ch==='"'){if(txt[i+1]==='"'){f+='"';i+=2;continue}q=false;i++;continue}
+      f+=ch;i++;continue;
+    }
+    if(ch==='"'&&f===''){q=true;i++;continue}
+    if(ch===sep){row.push(f);f='';i++;continue}
+    if(ch==='\r'){i++;continue}
+    if(ch==='\n'){row.push(f);rows.push(row);row=[];f='';i++;continue}
+    f+=ch;i++;
+  }
+  if(f!==''||row.length){row.push(f);rows.push(row)}
+  return rows;
+}
 function parseImport(txt){
-  var out=[];
-  txt.split(/\r?\n/).forEach(function(line){
-    if(!line.trim())return;
-    var i=line.indexOf('\t');if(i<0)i=line.indexOf(';');
-    if(i<0)return;
-    var f=line.slice(0,i).trim().replace(/\\n/g,'\n'),b=line.slice(i+1).trim().replace(/\\n/g,'\n');
+  txt=String(txt).replace(/^﻿/,'');
+  var meta={html:false},lines=txt.split(/\r?\n/),k=0;
+  while(k<lines.length&&/^#/.test(lines[k])){
+    var m=lines[k].match(/^#\s*([a-z ]+?)\s*:\s*(.*)$/i);
+    if(m){
+      var key=m[1].toLowerCase(),v=m[2].trim();
+      if(key==='separator')meta.sep=SEPS[v.toLowerCase()]||(v.length===1?v:null);
+      else if(key==='html')meta.html=v.toLowerCase()==='true';
+      else if(/ column$/.test(key))meta[key.replace(' column','')]=parseInt(v,10)-1;
+    }
+    k++;
+  }
+  var body=lines.slice(k).join('\n'),sep=meta.sep;
+  if(!sep){
+    var first=body.split('\n').find(function(l){return l.trim()})||'';
+    sep=first.indexOf('\t')>=0?'\t':first.indexOf(';')>=0?';':first.indexOf('|')>=0?'|':first.indexOf(',')>=0?',':';';
+  }
+  var skip={};
+  ['guid','notetype','deck','tags'].forEach(function(n){if(meta[n]>=0)skip[meta[n]]=1});
+  var out=[],clozeRe=/\{\{c(\d+)::([\s\S]*?)(?:::([^}]*))?\}\}/g;
+  splitRows(body,sep).forEach(function(r){
+    if(r.every(function(x){return !x.trim()}))return;
+    var fields=r.filter(function(_,i){return !skip[i]});
+    var f=cleanField(fields[0]||'',meta.html),b=cleanField(fields[1]||'',meta.html);
+    if(/\{\{c\d+::/.test(f)){
+      var nums=[];
+      f.replace(/\{\{c(\d+)::/g,function(_,n){if(nums.indexOf(n)<0)nums.push(n);return ''});
+      var shown=f.replace(clozeRe,function(_,i,t){return t});
+      nums.forEach(function(n){
+        var front=f.replace(clozeRe,function(_,i,t,h){return i===n?'['+(h||'…')+']':t});
+        out.push(newCard(front,b?shown+'\n\n'+b:shown));
+      });
+      return;
+    }
     if(f&&b)out.push(newCard(f,b));
   });
   return out;
 }
 function exportText(d){
-  return d.cards.map(function(c){return c.f.replace(/\n/g,'\\n')+'\t'+c.b.replace(/\n/g,'\\n')}).join('\n');
+  var e=function(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\t/g,' ').replace(/\n/g,'<br>')};
+  return '#separator:tab\n#html:true\n'+d.cards.map(function(c){return e(c.f)+'\t'+e(c.b)}).join('\n');
 }
 function flash(msg){
   S.flash=msg;
@@ -358,11 +414,17 @@ function act(a,ds){
       d.cards.push(newCard(f,b));persist(S.deckId);
       render();$('#cf').value='';$('#cb').value='';$('#cf').focus();
       S.flash='';flash('Carte ajoutée · '+d.cards.length+' au total');$('#flash').textContent=S.flash;break;
+    case 'pickfile':var pf=$('#ifile');if(pf)pf.click();break;
     case 'import':
       var cs=parseImport(val('io'));
-      if(!cs.length){flash('Aucune ligne valide.');$('#flash').textContent=S.flash;break}
-      d.cards=d.cards.concat(cs);persist(S.deckId);render();$('#io').value='';
-      flash(cs.length+' cartes importées');$('#flash').textContent=S.flash;break;
+      if(!cs.length){flash('Aucune carte reconnue.');$('#flash').textContent=S.flash;break}
+      var seen={};d.cards.forEach(function(c){seen[c.f+'\u0000'+c.b]=1});
+      var fresh=cs.filter(function(c){var k=c.f+'\u0000'+c.b;if(seen[k])return false;seen[k]=1;return true});
+      if(fresh.length){d.cards=d.cards.concat(fresh);persist(S.deckId)}
+      render();$('#io').value='';
+      var dup=cs.length-fresh.length;
+      flash(fresh.length+' carte'+(fresh.length>1?'s':'')+' importée'+(fresh.length>1?'s':'')+(dup?' · '+dup+' déjà présente'+(dup>1?'s':''):''));
+      $('#flash').textContent=S.flash;break;
     case 'export':
       var txt=exportText(d),ta=$('#io');ta.value=txt;
       var done=function(){flash('Export copié');$('#flash').textContent=S.flash};
@@ -379,6 +441,18 @@ function act(a,ds){
 document.addEventListener('click',function(e){
   var b=e.target.closest('[data-act]');if(!b||b.disabled)return;
   act(b.dataset.act,b.dataset);
+});
+document.addEventListener('change',function(e){
+  var el=e.target;
+  if(!el||el.id!=='ifile'||!el.files||!el.files[0])return;
+  var file=el.files[0],msg=function(t){flash(t);var fl=$('#flash');if(fl)fl.textContent=S.flash};
+  if(/\.apkg$/i.test(file.name)){msg('.apkg non lu : exporte en « Notes en texte brut » depuis Anki.');el.value='';return}
+  file.text().then(function(t){
+    var ta=$('#io');if(ta)ta.value=t;
+    var n=parseImport(t).length;
+    msg(n?n+' carte'+(n>1?'s':'')+' détectée'+(n>1?'s':'')+'. Touche Importer.':'Aucune carte reconnue dans ce fichier.');
+    el.value='';
+  },function(){msg('Lecture du fichier impossible.')});
 });
 document.addEventListener('keydown',function(e){
   var t=e.target&&e.target.tagName;
@@ -445,8 +519,10 @@ function viewDeck(){
        '<div class="field"><label for="cb">Verso</label><textarea id="cb" data-keep placeholder="Réponse"></textarea></div>'+
        '<button class="btn primary block" data-act="addcard">Ajouter la carte</button><p class="flash" id="flash" role="status"></p></div>';
   }else{
-    h+='<div class="panel"><div class="field"><label for="io">Une carte par ligne : recto ; verso</label><textarea id="io" data-keep style="min-height:160px" placeholder="Recto ; Verso&#10;(séparateur : point-virgule ou tabulation, comme un export texte Anki)"></textarea></div>'+
-       '<div class="stack"><button class="btn primary block" data-act="import">Importer</button><button class="btn block" data-act="export">Exporter ce paquet</button></div><p class="flash" id="flash" role="status"></p></div>'+
+    h+='<div class="panel"><div class="field"><label for="io">Colle des cartes ou charge un fichier</label><textarea id="io" data-keep style="min-height:160px" placeholder="Export texte Anki, CSV, ou une carte par ligne : recto ; verso"></textarea></div>'+
+       '<input id="ifile" type="file" accept=".txt,.csv,.tsv,.text,.apkg,text/plain,text/csv" hidden>'+
+       '<div class="stack"><button class="btn block" data-act="pickfile">Choisir un fichier</button><button class="btn primary block" data-act="import">Importer</button><button class="btn block" data-act="export">Exporter ce paquet</button></div><p class="flash" id="flash" role="status"></p></div>'+
+       '<p class="note">Formats lus : export Anki en texte brut (.txt avec ses lignes #), CSV, cartes à trous {{c1::…}}, HTML nettoyé. Les .apkg ne sont pas lus : dans Anki, Fichier → Exporter → Notes en texte brut.</p>'+
        '<div style="margin-top:14px"><button class="btn danger block'+(S.arm==='deck'?' armed':'')+'" data-act="deldeck">'+(S.arm==='deck'?'Confirmer : supprimer ce paquet':'Supprimer ce paquet')+'</button></div>';
   }
   return h;
