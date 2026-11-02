@@ -49,6 +49,8 @@ h1,h2{font-family:var(--font-display);margin:0;text-wrap:balance;letter-spacing:
 .muted{color:var(--ink-2)}
 
 .top{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:6px 0 18px}
+.top .acts{display:flex;gap:8px}
+.seg.two{grid-template-columns:repeat(2,1fr)}
 .top h1{font-size:1.9rem;font-weight:700}
 .top .sub{margin:2px 0 0;font-size:.875rem;color:var(--ink-2)}
 .ibtn{width:44px;height:44px;border-radius:12px;display:grid;place-items:center;color:var(--ink);background:var(--surface);border:1px solid var(--line);flex:none}
@@ -134,6 +136,8 @@ h1,h2{font-family:var(--font-display);margin:0;text-wrap:balance;letter-spacing:
 </style>
 
 <div id="app"></div>
+<script src="config.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
 
 <script>
 (function(){
@@ -141,8 +145,10 @@ h1,h2{font-family:var(--font-display);margin:0;text-wrap:balance;letter-spacing:
 var MIN=60000, DAY=86400000, NEW_CAP=20, LEARN_AHEAD=20*MIN;
 var $=function(s){return document.querySelector(s)};
 var esc=function(s){return String(s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})};
-var S={decks:{},view:'home',deckId:null,tab:'cards',sess:null,mode:'local',sync:'init',creating:false,arm:null,flash:''};
-var col=null, dirty=new Set(), writing=new Set();
+var S={decks:{},view:'home',deckId:null,tab:'cards',sess:null,sync:'init',creating:false,arm:null,flash:'',user:null,account:'in',authErr:'',authInfo:'',busy:false,recovery:false};
+var CFG=window.MEMORIUM||{};
+var sb=null,flushing=false,again=false,timer=null;
+var pend={d:{},c:{},xc:{},xd:{}};
 
 var I={
  back:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>',
@@ -150,6 +156,7 @@ var I={
  plus:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>',
  undo:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14L4 9l5-5"/><path d="M4 9h10a6 6 0 010 12h-3"/></svg>',
  trash:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>',
+ user:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4.4 3.6-7 8-7s8 2.6 8 7"/></svg>',
  chev:'<svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>'
 };
 
@@ -206,56 +213,148 @@ function todayDone(){
 
 function lsLoad(){try{return JSON.parse(localStorage.getItem('memorium.v1')||'{}')}catch(e){return{}}}
 function lsSave(){try{localStorage.setItem('memorium.v1',JSON.stringify(S.decks))}catch(e){}}
-async function persist(id){
-  dirty.add(id);
-  if(writing.has(id))return;
-  writing.add(id);
+function anyPending(){return flushing||Object.keys(pend.d).length>0||Object.keys(pend.c).length>0||Object.keys(pend.xc).length>0||Object.keys(pend.xd).length>0}
+function later(){clearTimeout(timer);timer=setTimeout(flush,S.user?600:250)}
+function markDeck(id){pend.d[id]=1;later()}
+function markCard(did,cid){pend.c[cid]=did;later()}
+function markDelCard(cid){delete pend.c[cid];pend.xc[cid]=1;later()}
+function markDelDeck(did){
+  delete pend.d[did];
+  Object.keys(pend.c).forEach(function(c){if(pend.c[c]===did)delete pend.c[c]});
+  pend.xd[did]=1;later();
+}
+function saveDeck(id){
+  markDeck(id);
+  (S.decks[id].cards||[]).forEach(function(c){markCard(id,c.id)});
+}
+function ck(r){if(r&&r.error)throw r.error;return r}
+function chunk(a,n){var o=[];for(var i=0;i<a.length;i+=n)o.push(a.slice(i,i+n));return o}
+async function flush(){
+  if(flushing){again=true;return}
+  flushing=true;
+  var p=pend;pend={d:{},c:{},xc:{},xd:{}};
   try{
-    while(dirty.has(id)){
-      dirty.delete(id);
-      var d=S.decks[id];
-      if(col){
-        if(d)await col.doc(id).set(JSON.parse(JSON.stringify(d)));
-        else await col.doc(id).delete();
-      }else lsSave();
-    }
+    if(sb&&S.user){
+      var u=S.user.id,xd=Object.keys(p.xd),xc=Object.keys(p.xc);
+      if(xd.length)ck(await sb.from('decks').delete().in('id',xd));
+      var dr=Object.keys(p.d).filter(function(id){return S.decks[id]}).map(function(id){
+        var d=S.decks[id];return{id:id,user_id:u,name:d.name,log:d.log||{},created:d.created||0};
+      });
+      if(dr.length)ck(await sb.from('decks').upsert(dr));
+      var byDeck={},rows=[];
+      Object.keys(p.c).forEach(function(cid){(byDeck[p.c[cid]]=byDeck[p.c[cid]]||[]).push(cid)});
+      Object.keys(byDeck).forEach(function(did){
+        var dk=S.decks[did];if(!dk)return;
+        var m={};dk.cards.forEach(function(c){m[c.id]=c});
+        byDeck[did].forEach(function(cid){if(m[cid])rows.push({id:cid,deck_id:did,user_id:u,data:m[cid]})});
+      });
+      var parts=chunk(rows,500),i;
+      for(i=0;i<parts.length;i++)ck(await sb.from('cards').upsert(parts[i]));
+      parts=chunk(xc,200);
+      for(i=0;i<parts.length;i++)ck(await sb.from('cards').delete().in('id',parts[i]));
+    }else lsSave();
+    if(S.sync==='error'||S.sync==='syncing'){S.sync='ok';render()}
+  }catch(e){
+    ['d','c','xc','xd'].forEach(function(k){Object.keys(p[k]).forEach(function(i){if(!(i in pend[k]))pend[k][i]=p[k][i]})});
+    S.sync='error';render();
+  }finally{flushing=false;if(again){again=false;later()}}
+}
+async function pull(){
+  if(!sb||!S.user||anyPending())return;
+  try{
+    var decks=[],cards=[],from=0,n=1000,r;
+    do{r=ck(await sb.from('decks').select('id,name,log,created').order('id').range(from,from+n-1));decks=decks.concat(r.data);from+=n}while(r.data.length===n);
+    from=0;
+    do{r=ck(await sb.from('cards').select('id,deck_id,data').order('id').range(from,from+n-1));cards=cards.concat(r.data);from+=n}while(r.data.length===n);
+    if(anyPending())return;
+    var next={};
+    decks.forEach(function(d){next[d.id]={name:d.name,log:d.log||{},created:d.created||0,cards:[]}});
+    cards.forEach(function(c){if(next[c.deck_id])next[c.deck_id].cards.push(c.data)});
+    S.decks=next;S.sync='ok';
+    if(S.deckId&&!S.decks[S.deckId]&&S.view!=='home'&&S.view!=='account'){S.view='home';S.sess=null}
+    render();
   }catch(e){S.sync='error';render()}
-  finally{writing.delete(id)}
 }
-function ingest(snap){
-  var next={};
-  snap.docs.forEach(function(ds){
-    var v=ds.data();
-    if(!v||!Array.isArray(v.cards))return;
-    if(dirty.has(ds.id)||writing.has(ds.id))return;
-    next[ds.id]=JSON.parse(JSON.stringify(v));
-  });
-  Object.keys(S.decks).forEach(function(id){
-    if((dirty.has(id)||writing.has(id))&&S.decks[id])next[id]=S.decks[id];
-  });
-  S.decks=next;
-  if(S.deckId&&!S.decks[S.deckId]&&S.view!=='home'){S.view='home';S.sess=null}
-}
-async function init(){
-  render();
-  var db=null,id=null;
-  try{
-    if(window.claude&&window.claude.use){
-      var u=await window.claude.use('user');
-      id=u?await u.id():null;
-      db=id?await window.claude.use('db'):null;
+function syncNow(){S.sync='syncing';render();clearTimeout(timer);flush().then(pull)}
+async function afterSignIn(){
+  S.sync='syncing';render();
+  await pull();
+  var loc=lsLoad(),ids=Object.keys(loc).filter(function(id){return !S.decks[id]&&loc[id]&&Array.isArray(loc[id].cards)});
+  if(ids.length&&S.sync!=='error'){
+    ids.forEach(function(id){S.decks[id]=loc[id];saveDeck(id)});
+    clearTimeout(timer);await flush();
+    if(S.sync!=='error'){
+      try{localStorage.removeItem('memorium.v1')}catch(e){}
+      flash(ids.length+' paquet'+(ids.length>1?'s':'')+' de cet appareil ajouté'+(ids.length>1?'s':'')+' à ton compte');
     }
-  }catch(e){db=null}
-  if(db&&id){
-    col=db.collection('data/users/'+id);S.mode='cloud';S.sync='loading';render();
-    var t=setTimeout(function(){if(S.sync==='loading'){S.sync='slow';render()}},10000);
-    col.onSnapshot(function(snap){
-      if(!snap.metadata.fromCache){clearTimeout(t);S.sync='ok'}
-      ingest(snap);render();
-    },function(){clearTimeout(t);S.sync='error';render()});
-  }else{
-    S.mode='local';S.decks=lsLoad();S.sync='ok';render();
   }
+  render();
+}
+function authMsg(e){
+  var m=String(e&&e.message||'');
+  if(/invalid login/i.test(m))return 'E-mail ou mot de passe incorrect.';
+  if(/already (been )?registered/i.test(m))return 'Un compte existe déjà avec cet e-mail.';
+  if(/not confirmed/i.test(m))return 'E-mail pas encore confirmé. Ouvre le lien reçu par e-mail.';
+  if(/rate limit|too many|seconds/i.test(m))return 'Trop de tentatives. Réessaie dans quelques minutes.';
+  if(/password/i.test(m))return 'Mot de passe refusé : 8 caractères minimum.';
+  if(/valid email|invalid.*email/i.test(m))return 'Adresse e-mail invalide.';
+  return 'Action impossible. Vérifie ta connexion internet.';
+}
+async function doAuth(){
+  var em=val('em').trim(),pw=val('pw');
+  S.authInfo='';
+  if(!em||!pw){S.authErr='Renseigne l’e-mail et le mot de passe.';render();return}
+  if(S.account==='up'&&pw.length<8){S.authErr='Mot de passe : 8 caractères minimum.';render();return}
+  S.busy=true;S.authErr='';render();
+  try{
+    if(S.account==='up'){
+      var r=await sb.auth.signUp({email:em,password:pw,options:{emailRedirectTo:location.href.split('#')[0]}});
+      if(r.error)throw r.error;
+      if(!r.data.session){S.authInfo='Compte créé. Ouvre le lien reçu par e-mail pour le confirmer, puis connecte-toi.';S.account='in'}
+    }else{
+      var r2=await sb.auth.signInWithPassword({email:em,password:pw});
+      if(r2.error)throw r2.error;
+      S.view='home';
+    }
+  }catch(e){S.authErr=authMsg(e)}
+  S.busy=false;render();
+}
+async function doReset(){
+  var em=val('em').trim();S.authInfo='';
+  if(!em){S.authErr='Saisis ton e-mail, puis touche « Mot de passe oublié ».';render();return}
+  try{
+    var r=await sb.auth.resetPasswordForEmail(em,{redirectTo:location.href.split('#')[0]});
+    if(r.error)throw r.error;
+    S.authErr='';S.authInfo='Lien envoyé. Vérifie tes e-mails.';
+  }catch(e){S.authErr=authMsg(e)}
+  render();
+}
+async function doSetPw(){
+  var pw=val('pw');
+  if(pw.length<8){S.authErr='Mot de passe : 8 caractères minimum.';render();return}
+  S.busy=true;S.authErr='';render();
+  try{
+    var r=await sb.auth.updateUser({password:pw});
+    if(r.error)throw r.error;
+    S.recovery=false;S.view='home';flash('Mot de passe mis à jour');
+  }catch(e){S.authErr=authMsg(e)}
+  S.busy=false;render();
+}
+function init(){
+  if(CFG.url&&CFG.key&&window.supabase&&window.supabase.createClient){
+    sb=window.supabase.createClient(CFG.url,CFG.key);
+    S.sync='loading';render();
+    var guard=setTimeout(function(){if(S.sync==='loading'){S.decks=lsLoad();S.sync='ok';render()}},8000);
+    sb.auth.onAuthStateChange(function(ev,session){
+      clearTimeout(guard);
+      var was=S.user&&S.user.id;
+      S.user=session?session.user:null;
+      if(ev==='PASSWORD_RECOVERY'){S.recovery=true;S.view='account';render();return}
+      if(S.user&&was!==S.user.id){setTimeout(afterSignIn,0)}
+      else if(!S.user&&(was||S.sync==='loading')){S.decks=lsLoad();S.sync='ok';if(was){S.view='home';S.sess=null}render()}
+      else render();
+    });
+  }else{S.decks=lsLoad();S.sync='ok';render()}
 }
 
 function sampleCards(){
@@ -274,7 +373,7 @@ function sampleCards(){
 function addDeck(name,cards){
   var id=uid('d');
   S.decks[id]={name:name,cards:cards||[],log:{},created:Date.now()};
-  persist(id);return id;
+  saveDeck(id);return id;
 }
 function startStudy(id){
   var d=S.decks[id],now=Date.now(),eod=endToday();
@@ -300,7 +399,7 @@ function grade(g){
   s.queue.shift();
   if(c.st===1){s.queue.splice(Math.min(s.queue.length,3),0,c.id)}
   s.shown=false;s.done++;
-  persist(s.deckId);render();window.scrollTo(0,0);
+  markCard(s.deckId,c.id);markDeck(s.deckId);render();window.scrollTo(0,0);
 }
 function undo(){
   var s=S.sess;if(!s||!s.hist.length)return;
@@ -313,7 +412,8 @@ function undo(){
     d.log[h.k]=Math.max(0,(d.log[h.k]||1)-1);
   }
   s.shown=false;s.done=Math.max(0,s.done-1);
-  persist(s.deckId);render();
+  if(c)markCard(s.deckId,c.id);
+  markDeck(s.deckId);render();
 }
 var SEPS={tab:'\t',semicolon:';',comma:',',pipe:'|',colon:':',space:' '};
 function decodeHtml(s){var t=document.createElement('textarea');t.innerHTML=s;return t.value}
@@ -411,16 +511,21 @@ function act(a,ds){
     case 'addcard':
       var f=val('cf').trim(),b=val('cb').trim();
       if(!f||!b){S.flash='';flash('Remplis les deux faces.');var fl=$('#flash');if(fl){fl.textContent='Remplis les deux faces.'}break}
-      d.cards.push(newCard(f,b));persist(S.deckId);
+      var nc=newCard(f,b);d.cards.push(nc);markCard(S.deckId,nc.id);
       render();$('#cf').value='';$('#cb').value='';$('#cf').focus();
       S.flash='';flash('Carte ajoutée · '+d.cards.length+' au total');$('#flash').textContent=S.flash;break;
+    case 'account':S.view='account';S.authErr='';S.authInfo='';render();break;
+    case 'authmode':S.account=ds.mode;S.authErr='';S.authInfo='';render();break;
+    case 'reset':doReset();break;
+    case 'signout':if(sb)sb.auth.signOut();break;
+    case 'syncnow':syncNow();break;
     case 'pickfile':var pf=$('#ifile');if(pf)pf.click();break;
     case 'import':
       var cs=parseImport(val('io'));
       if(!cs.length){flash('Aucune carte reconnue.');$('#flash').textContent=S.flash;break}
       var seen={};d.cards.forEach(function(c){seen[c.f+'\u0000'+c.b]=1});
       var fresh=cs.filter(function(c){var k=c.f+'\u0000'+c.b;if(seen[k])return false;seen[k]=1;return true});
-      if(fresh.length){d.cards=d.cards.concat(fresh);persist(S.deckId)}
+      if(fresh.length){d.cards=d.cards.concat(fresh);fresh.forEach(function(c){markCard(S.deckId,c.id)})}
       render();$('#io').value='';
       var dup=cs.length-fresh.length;
       flash(fresh.length+' carte'+(fresh.length>1?'s':'')+' importée'+(fresh.length>1?'s':'')+(dup?' · '+dup+' déjà présente'+(dup>1?'s':''):''));
@@ -432,15 +537,23 @@ function act(a,ds){
       try{navigator.clipboard.writeText(txt).then(done,fail)}catch(e){fail()}break;
     case 'delcard':
       if(S.arm!==ds.id){S.arm=ds.id;render();break}
-      d.cards=d.cards.filter(function(c){return c.id!==ds.id});S.arm=null;persist(S.deckId);render();break;
+      d.cards=d.cards.filter(function(c){return c.id!==ds.id});S.arm=null;markDelCard(ds.id);render();break;
     case 'deldeck':
       if(S.arm!=='deck'){S.arm='deck';render();break}
-      var did=S.deckId;delete S.decks[did];S.arm=null;S.view='home';persist(did);render();break;
+      var did=S.deckId;markDelDeck(did);delete S.decks[did];S.arm=null;S.view='home';render();break;
   }
 }
 document.addEventListener('click',function(e){
   var b=e.target.closest('[data-act]');if(!b||b.disabled)return;
   act(b.dataset.act,b.dataset);
+});
+document.addEventListener('submit',function(e){
+  e.preventDefault();
+  var f=e.target&&e.target.dataset&&e.target.dataset.form;
+  if(f==='auth')doAuth();else if(f==='setpw')doSetPw();
+});
+document.addEventListener('visibilitychange',function(){
+  if(!document.hidden&&S.user&&S.view!=='study')pull();
 });
 document.addEventListener('change',function(e){
   var el=e.target;
@@ -470,6 +583,7 @@ function cntHtml(c){
 }
 function syncBanner(){
   if(S.sync==='slow')return '<p class="banner">Synchronisation lente. Les cartes affichées peuvent ne pas être à jour.</p>';
+  if(S.sync==='error'&&S.user)return '<p class="banner err">Synchronisation impossible. Tes dernières modifications partiront dès que la connexion revient.<br><button class="btn" data-act="syncnow" style="margin-top:8px">Réessayer</button></p>';
   if(S.sync==='error')return '<p class="banner err">La sauvegarde a échoué. Tes dernières modifications ne sont peut-être pas enregistrées.</p>';
   return '';
 }
@@ -477,7 +591,8 @@ function viewHome(){
   var ids=Object.keys(S.decks).sort(function(a,b){return (S.decks[a].created||0)-(S.decks[b].created||0)});
   var td=todayDone();
   var h='<header class="top"><div><h1>Mémorium</h1><p class="sub mono">'+td+' carte'+(td>1?'s':'')+' révisée'+(td>1?'s':'')+' aujourd’hui</p></div>'+
-        '<button class="ibtn" data-act="newdeck" aria-label="Nouveau paquet">'+I.plus+'</button></header>'+syncBanner();
+        '<div class="acts">'+(sb?'<button class="ibtn" data-act="account" aria-label="'+(S.user?'Compte : '+esc(S.user.email||''):'Se connecter')+'">'+I.user+'</button>':'')+
+        '<button class="ibtn" data-act="newdeck" aria-label="Nouveau paquet">'+I.plus+'</button></div></header>'+syncBanner();
   if(S.creating){
     h+='<div class="panel" style="margin-bottom:12px"><div class="field"><label for="deckname">Nom du paquet</label><input id="deckname" data-keep maxlength="60" autocomplete="off" placeholder="ex. Capteurs et ADC"></div>'+
        '<div class="stack"><button class="btn primary block" data-act="mkdeck">Créer le paquet</button><button class="btn block" data-act="cancelnew">Annuler</button></div></div>';
@@ -493,7 +608,7 @@ function viewHome(){
       return '<button class="deck" data-act="open" data-id="'+esc(id)+'"><div class="grow"><div class="name">'+esc(d.name)+'</div><div class="meta">'+d.cards.length+' carte'+(d.cards.length>1?'s':'')+(due?'':' · à jour')+'</div></div>'+cntHtml(c)+I.chev+'</button>';
     }).join('')+'</div>';
   }
-  h+='<p class="note">'+(S.mode==='cloud'?'Paquets enregistrés dans ton compte, privés.':'Paquets enregistrés sur cet appareil uniquement.')+' Légende : <span class="c-n mono">nouvelles</span> · <span class="c-l mono">apprentissage</span> · <span class="c-r mono">à revoir</span></p>';
+  h+='<p class="note">'+(S.user?'Paquets synchronisés avec ton compte.':sb?'Paquets enregistrés sur cet appareil. Connecte-toi pour les retrouver partout.':'Paquets enregistrés sur cet appareil uniquement.')+' Légende : <span class="c-n mono">nouvelles</span> · <span class="c-l mono">apprentissage</span> · <span class="c-r mono">à revoir</span></p>';
   return h;
 }
 function stLabel(c){
@@ -527,6 +642,29 @@ function viewDeck(){
   }
   return h;
 }
+function viewAccount(){
+  var h='<div class="dhead"><button class="ibtn plain" data-act="home" aria-label="Retour">'+I.back+'</button><h1>Compte</h1></div>';
+  if(!sb)return h+'<div class="panel"><p style="margin:0">La synchronisation n’est pas configurée sur ce site. Tes paquets restent sur cet appareil.</p></div>';
+  var err=S.authErr?'<p class="banner err" role="alert">'+esc(S.authErr)+'</p>':'';
+  var info=S.authInfo?'<p class="banner" role="status">'+esc(S.authInfo)+'</p>':'';
+  if(S.recovery){
+    return h+err+'<form class="panel" data-form="setpw"><div class="field"><label for="pw">Nouveau mot de passe</label><input id="pw" data-keep type="password" autocomplete="new-password" minlength="8"></div>'+
+      '<button class="btn primary block" type="submit"'+(S.busy?' disabled':'')+'>Enregistrer le mot de passe</button></form>';
+  }
+  if(S.user){
+    var st=S.sync==='syncing'?'Synchronisation en cours…':S.sync==='error'?'Dernière synchronisation échouée.':'Synchronisé.';
+    return h+syncBanner()+'<div class="panel"><div class="field"><label>Connecté</label><div class="mono" style="overflow-wrap:anywhere">'+esc(S.user.email||'')+'</div></div>'+
+      '<p class="muted" style="margin:0 0 14px">'+st+'</p><div class="stack"><button class="btn block" data-act="syncnow">Synchroniser maintenant</button><button class="btn block" data-act="signout">Se déconnecter</button></div></div>'+
+      '<p class="note">Tes paquets et ta progression (étape de chaque carte, prochaine révision, historique du jour) sont enregistrés dans ton compte et retrouvés sur tous tes appareils.</p>';
+  }
+  var up=S.account==='up';
+  return h+info+err+'<div class="seg two" role="tablist"><button role="tab" aria-selected="'+(!up)+'" data-act="authmode" data-mode="in">Connexion</button><button role="tab" aria-selected="'+up+'" data-act="authmode" data-mode="up">Créer un compte</button></div>'+
+    '<form class="panel" data-form="auth"><div class="field"><label for="em">E-mail</label><input id="em" data-keep type="email" autocomplete="email" inputmode="email"></div>'+
+    '<div class="field"><label for="pw">Mot de passe'+(up?' (8 caractères minimum)':'')+'</label><input id="pw" data-keep type="password" autocomplete="'+(up?'new-password':'current-password')+'"></div>'+
+    '<button class="btn primary block" type="submit"'+(S.busy?' disabled':'')+'>'+(up?'Créer mon compte':'Se connecter')+'</button>'+
+    (up?'':'<button class="btn block" type="button" data-act="reset" style="margin-top:10px">Mot de passe oublié</button>')+'</form>'+
+    '<p class="note">Les paquets présents sur cet appareil seront ajoutés à ton compte à la première connexion.</p>';
+}
 function viewStudy(){
   var s=S.sess,d=S.decks[s.deckId];if(!d)return viewHome();
   var c=cur();
@@ -559,7 +697,7 @@ function render(){
   var keep=Array.prototype.map.call(document.querySelectorAll('[data-keep]'),function(e){
     return{id:e.id,v:e.value,f:document.activeElement===e,s:e.selectionStart};
   });
-  $('#app').innerHTML=S.view==='study'&&S.sess?viewStudy():S.view==='deck'?viewDeck():viewHome();
+  $('#app').innerHTML=S.view==='study'&&S.sess?viewStudy():S.view==='deck'?viewDeck():S.view==='account'?viewAccount():viewHome();
   keep.forEach(function(k){
     var e=document.getElementById(k.id);
     if(e){e.value=k.v;if(k.f){e.focus();try{e.setSelectionRange(k.s,k.s)}catch(_){}}}
