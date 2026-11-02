@@ -298,7 +298,7 @@ function authMsg(e){
   if(/rate limit|too many|seconds/i.test(m))return 'Trop de tentatives. Réessaie dans quelques minutes.';
   if(/password/i.test(m))return 'Mot de passe refusé : 8 caractères minimum.';
   if(/valid email|invalid.*email/i.test(m))return 'Adresse e-mail invalide.';
-  return 'Action impossible. Vérifie ta connexion internet.';
+  return 'Action impossible'+(m?' ('+m+')':'')+'. Vérifie ta connexion internet.';
 }
 async function doAuth(){
   var em=val('em').trim(),pw=val('pw');
